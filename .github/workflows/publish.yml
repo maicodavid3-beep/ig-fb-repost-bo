@@ -1,0 +1,163 @@
+name: Publicar videos (Instagram + Facebook)
+
+on:
+  # 4 horarios por día, hora Argentina (UTC-3): 10:00 / 13:00 / 17:00 / 20:00
+  # -> 13:00 / 16:00 / 20:00 / 23:00 UTC. En cada uno de estos horarios se
+  # corre el "ciclo" completo: primero publica el Reel normal de Instagram +
+  # el posteo en Facebook de cualquier video que ya haya cumplido sus 24hs
+  # desde su Trial Reel, y después sube un Trial Reel nuevo a Instagram del
+  # próximo video de la cola.
+  schedule:
+    - cron: "0 13,16,20,23 * * *"
+  # Para probar manualmente desde la pestaña "Actions" de GitHub sin esperar
+  # al horario. "ciclo" es el modo normal; fase1/fase2 son solo para forzar
+  # una fase puntual durante una prueba.
+  workflow_dispatch:
+    inputs:
+      fase:
+        description: "ciclo (normal) / fase1 o fase2 (forzado, solo para pruebas)"
+        required: true
+        default: "ciclo"
+
+permissions:
+  contents: write
+
+# Evita que dos corridas se ejecuten al mismo tiempo (por ejemplo si el cron
+# nativo de GitHub y el respaldo externo de cron-job.org disparan casi juntos).
+# Si una ya está corriendo, la siguiente espera en cola en vez de correr en
+# paralelo — así nunca se procesa el mismo video "pending" dos veces.
+concurrency:
+  group: publicar-videos
+  cancel-in-progress: false
+
+jobs:
+  publicar:
+    runs-on: ubuntu-latest
+    # Límite máximo de toda la corrida. Si algo se traba (por ejemplo una
+    # conexión de red colgada) sin este límite, GitHub la dejaría corriendo
+    # hasta 6 horas por default, bloqueando además todas las corridas
+    # siguientes (por el "concurrency" de más abajo, que hace que esperen en
+    # cola en vez de correr en paralelo). Como el estado se guarda de a
+    # poco (ver orchestrator.py), cortar acá en el peor de los casos no
+    # pierde ni duplica nada: lo que ya se publicó de verdad queda
+    # registrado, y lo que falta lo retoma la corrida siguiente.
+    #
+    # 90 minutos por la misma razón que en el bot original: si se acumulan
+    # varios videos esperando su Fase 2, cada uno agrega 15 minutos de
+    # espera entre publicación y publicación (BACKLOG_GAP_SECONDS).
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Instalar dependencias
+        run: pip install -r requirements.txt
+
+      - name: Determinar fase
+        id: fase
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "fase=${{ github.event.inputs.fase }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "fase=ciclo" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Antes de tocar Instagram o Facebook, cada corrida "reserva" su turno
+      # subiendo un cambio mínimo a Git. Si dos corridas arrancan casi al
+      # mismo tiempo (por ejemplo el cron nativo de GitHub y el respaldo de
+      # cron-job.org), solo una de las dos va a lograr pushear su reserva;
+      # la otra va a ser rechazada por Git y se cancela SIN haber publicado
+      # nada todavía.
+      - name: Reservar turno (evita corridas duplicadas/superpuestas)
+        id: reservar
+        run: |
+          git config user.name "repost-bot"
+          git config user.email "repost-bot@users.noreply.github.com"
+          git pull --rebase || true
+
+          # OJO: los pasos de GitHub Actions corren con "set -e", así que un
+          # comando suelto que termine con código de salida distinto de 0
+          # corta el paso ENTERO ahí mismo. Como acá el código 2 es "avisá
+          # que hay que saltear, no es un error", hay que capturarlo con
+          # "|| claim_result=$?" en vez de dejar que la línea corte sola.
+          #
+          # IMPORTANTE: la clave que reservamos acá tiene que ser DISTINTA de
+          # "ciclo"/"fase1"/"fase2" a secas, porque el propio orchestrator.py
+          # también revisa esas mismas claves puertas adentro de ciclo()/
+          # fase1()/fase2() para su propio control de duplicados. Si
+          # usáramos la misma clave, la reserva quedaría marcada segundos
+          # antes de ejecutar el orquestador, y el orquestador se
+          # encontraría con su propia marca "recién puesta" y se frenaría
+          # solo sin publicar nada, siempre. Por eso acá usamos el prefijo
+          # "reserva-".
+          claim_result=0
+          python scripts/orchestrator.py claim "reserva-${{ steps.fase.outputs.fase }}" || claim_result=$?
+
+          if [ "$claim_result" = "2" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ "$claim_result" != "0" ]; then
+            echo "Error inesperado al reservar el turno (código $claim_result)."
+            exit 1
+          fi
+
+          git add state/last_run.json
+          git commit -m "Reserva turno (${{ steps.fase.outputs.fase }}) [skip ci]"
+
+          if git push; then
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "No se pudo reservar el turno: probablemente otra corrida lo reservó casi al mismo tiempo. No hago nada más en esta corrida (así se evita publicar dos veces)."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Ejecutar orquestador
+        if: steps.reservar.outputs.skip != 'true'
+        env:
+          IG_USER_ID: ${{ secrets.IG_USER_ID }}
+          IG_ACCESS_TOKEN: ${{ secrets.IG_ACCESS_TOKEN }}
+          FB_PAGE_ID: ${{ secrets.FB_PAGE_ID }}
+          FB_PAGE_ACCESS_TOKEN: ${{ secrets.FB_PAGE_ACCESS_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_BRANCH: main
+          # Sin esto, Python guarda la salida de los print() en un buffer y
+          # no la muestra en el log de GitHub Actions hasta que el proceso
+          # termina (o el buffer se llena). Con esto, cada línea aparece en
+          # el log apenas se imprime.
+          PYTHONUNBUFFERED: "1"
+        run: python scripts/orchestrator.py ${{ steps.fase.outputs.fase }}
+
+      - name: Guardar estado actualizado (queue.json / pending_normal.json)
+        if: steps.reservar.outputs.skip != 'true'
+        run: |
+          git config user.name "repost-bot"
+          git config user.email "repost-bot@users.noreply.github.com"
+          git add config/queue.json state/pending_normal.json state/last_run.json
+
+          if git diff --cached --quiet; then
+            echo "Nada para guardar."
+            exit 0
+          fi
+
+          git commit -m "Actualiza estado [skip ci]"
+
+          # Si el push es rechazado (por ejemplo por otra corrida que también
+          # llegó a pushear algo mientras tanto), reintenta con pull --rebase
+          # en vez de perder el resultado de esta corrida (que ya publicó de
+          # verdad en Instagram/Facebook y hay que dejarlo registrado sí o sí).
+          for i in 1 2 3; do
+            if git push; then
+              exit 0
+            fi
+            echo "Push rechazado, reintentando con pull --rebase (intento $i de 3)..."
+            git pull --rebase
+          done
+
+          echo "No se pudo guardar el estado final después de varios intentos."
+          exit 1
